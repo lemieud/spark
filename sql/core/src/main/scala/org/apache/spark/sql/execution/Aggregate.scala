@@ -21,9 +21,11 @@ import java.util.HashMap
 
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.SparkContext
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.SQLContext
 
 /**
  * :: DeveloperApi ::
@@ -41,10 +43,10 @@ case class Aggregate(
     partial: Boolean,
     groupingExpressions: Seq[Expression],
     aggregateExpressions: Seq[NamedExpression],
-    child: SparkPlan)(@transient sc: SparkContext)
-  extends UnaryNode with NoBind {
+    child: SparkPlan)
+  extends UnaryNode {
 
-  override def requiredChildDistribution =
+  override def requiredChildDistribution: List[Distribution] = {
     if (partial) {
       UnspecifiedDistribution :: Nil
     } else {
@@ -54,14 +56,9 @@ case class Aggregate(
         ClusteredDistribution(groupingExpressions) :: Nil
       }
     }
+  }
 
-  override def otherCopyArgs = sc :: Nil
-
-  // HACK: Generators don't correctly preserve their output through serializations so we grab
-  // out child's output attributes statically here.
-  private[this] val childOutput = child.output
-
-  override def output = aggregateExpressions.map(_.toAttribute)
+  override def output: Seq[Attribute] = aggregateExpressions.map(_.toAttribute)
 
   /**
    * An aggregate that needs to be computed for each row in a group.
@@ -77,20 +74,18 @@ case class Aggregate(
       resultAttribute: AttributeReference)
 
   /** A list of aggregates that need to be computed for each group. */
-  @transient
-  private[this] lazy val computedAggregates = aggregateExpressions.flatMap { agg =>
+  private[this] val computedAggregates = aggregateExpressions.flatMap { agg =>
     agg.collect {
       case a: AggregateExpression =>
         ComputedAggregate(
           a,
-          BindReferences.bindReference(a, childOutput).asInstanceOf[AggregateExpression],
-          AttributeReference(s"aggResult:$a", a.dataType, nullable = true)())
+          BindReferences.bindReference(a, child.output),
+          AttributeReference(s"aggResult:$a", a.dataType, a.nullable)())
     }
   }.toArray
 
   /** The schema of the result of all aggregate evaluations */
-  @transient
-  private[this] lazy val computedSchema = computedAggregates.map(_.resultAttribute)
+  private[this] val computedSchema = computedAggregates.map(_.resultAttribute)
 
   /** Creates a new aggregate buffer for a group. */
   private[this] def newAggregateBuffer(): Array[AggregateFunction] = {
@@ -104,8 +99,7 @@ case class Aggregate(
   }
 
   /** Named attributes used to substitute grouping attributes into the final result. */
-  @transient
-  private[this] lazy val namedGroups = groupingExpressions.map {
+  private[this] val namedGroups = groupingExpressions.map {
     case ne: NamedExpression => ne -> ne.toAttribute
     case e => e -> Alias(e, s"groupingExpr:$e")().toAttribute
   }
@@ -114,22 +108,20 @@ case class Aggregate(
    * A map of substitutions that are used to insert the aggregate expressions and grouping
    * expression into the final result expression.
    */
-  @transient
-  private[this] lazy val resultMap =
-    (computedAggregates.map { agg => agg.unbound -> agg.resultAttribute} ++ namedGroups).toMap
+  private[this] val resultMap =
+    (computedAggregates.map { agg => agg.unbound -> agg.resultAttribute } ++ namedGroups).toMap
 
   /**
    * Substituted version of aggregateExpressions expressions which are used to compute final
    * output rows given a group and the result of all aggregate computations.
    */
-  @transient
-  private[this] lazy val resultExpressions = aggregateExpressions.map { agg =>
+  private[this] val resultExpressions = aggregateExpressions.map { agg =>
     agg.transform {
       case e: Expression if resultMap.contains(e) => resultMap(e)
     }
   }
 
-  override def execute() = attachTree(this, "execute") {
+  protected override def doExecute(): RDD[Row] = attachTree(this, "execute") {
     if (groupingExpressions.isEmpty) {
       child.execute().mapPartitions { iter =>
         val buffer = newAggregateBuffer()
@@ -142,7 +134,7 @@ case class Aggregate(
             i += 1
           }
         }
-        val resultProjection = new Projection(resultExpressions, computedSchema)
+        val resultProjection = new InterpretedProjection(resultExpressions, computedSchema)
         val aggregateResults = new GenericMutableRow(computedAggregates.length)
 
         var i = 0
@@ -156,7 +148,7 @@ case class Aggregate(
     } else {
       child.execute().mapPartitions { iter =>
         val hashTable = new HashMap[Row, Array[AggregateFunction]]
-        val groupingProjection = new MutableProjection(groupingExpressions, childOutput)
+        val groupingProjection = new InterpretedMutableProjection(groupingExpressions, child.output)
 
         var currentRow: Row = null
         while (iter.hasNext) {
@@ -179,8 +171,9 @@ case class Aggregate(
           private[this] val hashTableIter = hashTable.entrySet().iterator()
           private[this] val aggregateResults = new GenericMutableRow(computedAggregates.length)
           private[this] val resultProjection =
-            new MutableProjection(resultExpressions, computedSchema ++ namedGroups.map(_._2))
-          private[this] val joinedRow = new JoinedRow
+            new InterpretedMutableProjection(
+              resultExpressions, computedSchema ++ namedGroups.map(_._2))
+          private[this] val joinedRow = new JoinedRow4
 
           override final def hasNext: Boolean = hashTableIter.hasNext
 

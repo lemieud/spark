@@ -33,6 +33,7 @@ import org.apache.hadoop.mapreduce.Job
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.SparkContext._
 
+
 /*
   Need to create following keyspace and column family in cassandra before running this example
   Start CQL shell using ./bin/cqlsh and execute following commands
@@ -103,8 +104,8 @@ object CassandraCQLTest {
 
     val casRdd = sc.newAPIHadoopRDD(job.getConfiguration(),
       classOf[CqlPagingInputFormat],
-      classOf[java.util.Map[String,ByteBuffer]],
-      classOf[java.util.Map[String,ByteBuffer]])
+      classOf[java.util.Map[String, ByteBuffer]],
+      classOf[java.util.Map[String, ByteBuffer]])
 
     println("Count: " + casRdd.count)
     val productSaleRDD = casRdd.map {
@@ -117,7 +118,7 @@ object CassandraCQLTest {
       case (productId, saleCount) => println(productId + ":" + saleCount)
     }
 
-    val casoutputCF  = aggregatedRDD.map {
+    val casoutputCF = aggregatedRDD.map {
       case (productId, saleCount) => {
         val outColFamKey = Map("prod_id" -> ByteBufferUtil.bytes(productId))
         val outKey: java.util.Map[String, ByteBuffer] = outColFamKey
@@ -135,5 +136,7 @@ object CassandraCQLTest {
         classOf[CqlOutputFormat],
         job.getConfiguration()
       )
+
+    sc.stop()
   }
 }

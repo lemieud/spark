@@ -52,7 +52,7 @@ private[spark] class MetadataCleaner(
     logDebug(
       "Starting metadata cleaner for " + name + " with delay of " + delaySeconds + " seconds " +
       "and period of " + periodSeconds + " secs")
-    timer.schedule(task, periodSeconds * 1000, periodSeconds * 1000)
+    timer.schedule(task, delaySeconds * 1000, periodSeconds * 1000)
   }
 
   def cancel() {
@@ -67,15 +67,16 @@ private[spark] object MetadataCleanerType extends Enumeration {
 
   type MetadataCleanerType = Value
 
-  def systemProperty(which: MetadataCleanerType.MetadataCleanerType) =
-      "spark.cleaner.ttl." + which.toString
+  def systemProperty(which: MetadataCleanerType.MetadataCleanerType): String = {
+    "spark.cleaner.ttl." + which.toString
+  }
 }
 
 // TODO: This mutates a Conf to set properties right now, which is kind of ugly when used in the
 // initialization of StreamingContext. It's okay for users trying to configure stuff themselves.
 private[spark] object MetadataCleaner {
-  def getDelaySeconds(conf: SparkConf) = {
-    conf.getInt("spark.cleaner.ttl", -1)
+  def getDelaySeconds(conf: SparkConf): Int = {
+    conf.getTimeAsSeconds("spark.cleaner.ttl", "-1").toInt
   }
 
   def getDelaySeconds(
@@ -88,11 +89,16 @@ private[spark] object MetadataCleaner {
       conf: SparkConf,
       cleanerType: MetadataCleanerType.MetadataCleanerType,
       delay: Int) {
-    conf.set(MetadataCleanerType.systemProperty(cleanerType),  delay.toString)
+    conf.set(MetadataCleanerType.systemProperty(cleanerType), delay.toString)
   }
 
+  /**
+   * Set the default delay time (in seconds).
+   * @param conf SparkConf instance
+   * @param delay default delay time to set
+   * @param resetAll whether to reset all to default
+   */
   def setDelaySeconds(conf: SparkConf, delay: Int, resetAll: Boolean = true) {
-    // override for all ?
     conf.set("spark.cleaner.ttl", delay.toString)
     if (resetAll) {
       for (cleanerType <- MetadataCleanerType.values) {

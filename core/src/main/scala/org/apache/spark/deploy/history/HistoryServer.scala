@@ -17,16 +17,19 @@
 
 package org.apache.spark.deploy.history
 
-import scala.collection.mutable
+import java.util.NoSuchElementException
+import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
 
-import org.apache.hadoop.fs.{FileStatus, Path}
+import com.google.common.cache._
+import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
 
 import org.apache.spark.{Logging, SecurityManager, SparkConf}
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.scheduler._
-import org.apache.spark.ui.{WebUI, SparkUI}
+import org.apache.spark.status.api.v1.{ApiRootResource, ApplicationInfo, ApplicationsListResource,
+  UIRoot}
+import org.apache.spark.ui.{SparkUI, UIUtils, WebUI}
 import org.apache.spark.ui.JettyUtils._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{SignalLogger, Utils}
 
 /**
  * A web server that renders SparkUIs of completed applications.
@@ -38,55 +41,79 @@ import org.apache.spark.util.Utils
  * application's event logs are maintained in the application's own sub-directory. This
  * is the same structure as maintained in the event log write code path in
  * EventLoggingListener.
- *
- * @param baseLogDir The base directory in which event logs are found
  */
 class HistoryServer(
-    val baseLogDir: String,
+    conf: SparkConf,
+    provider: ApplicationHistoryProvider,
     securityManager: SecurityManager,
-    conf: SparkConf)
-  extends WebUI(securityManager, HistoryServer.WEB_UI_PORT, conf) with Logging {
+    port: Int)
+  extends WebUI(securityManager, port, conf) with Logging with UIRoot {
 
-  import HistoryServer._
+  // How many applications to retain
+  private val retainedApplications = conf.getInt("spark.history.retainedApplications", 50)
 
-  private val fileSystem = Utils.getHadoopFileSystem(baseLogDir)
-  private val localHost = Utils.localHostName()
-  private val publicHost = Option(System.getenv("SPARK_PUBLIC_DNS")).getOrElse(localHost)
-
-  // A timestamp of when the disk was last accessed to check for log updates
-  private var lastLogCheckTime = -1L
-
-  // Number of completed applications found in this directory
-  private var numCompletedApplications = 0
-
-  @volatile private var stopped = false
-
-  /**
-   * A background thread that periodically checks for event log updates on disk.
-   *
-   * If a log check is invoked manually in the middle of a period, this thread re-adjusts the
-   * time at which it performs the next log check to maintain the same period as before.
-   *
-   * TODO: Add a mechanism to update manually.
-   */
-  private val logCheckingThread = new Thread {
-    override def run(): Unit = Utils.logUncaughtExceptions {
-      while (!stopped) {
-        val now = System.currentTimeMillis
-        if (now - lastLogCheckTime > UPDATE_INTERVAL_MS) {
-          checkForLogs()
-          Thread.sleep(UPDATE_INTERVAL_MS)
-        } else {
-          // If the user has manually checked for logs recently, wait until
-          // UPDATE_INTERVAL_MS after the last check time
-          Thread.sleep(lastLogCheckTime + UPDATE_INTERVAL_MS - now)
-        }
-      }
+  private val appLoader = new CacheLoader[String, SparkUI] {
+    override def load(key: String): SparkUI = {
+      val parts = key.split("/")
+      require(parts.length == 1 || parts.length == 2, s"Invalid app key $key")
+      val ui = provider
+        .getAppUI(parts(0), if (parts.length > 1) Some(parts(1)) else None)
+        .getOrElse(throw new NoSuchElementException(s"no app with key $key"))
+      attachSparkUI(ui)
+      ui
     }
   }
 
-  // A mapping of application ID to its history information, which includes the rendered UI
-  val appIdToInfo = mutable.HashMap[String, ApplicationHistoryInfo]()
+  private val appCache = CacheBuilder.newBuilder()
+    .maximumSize(retainedApplications)
+    .removalListener(new RemovalListener[String, SparkUI] {
+      override def onRemoval(rm: RemovalNotification[String, SparkUI]): Unit = {
+        detachSparkUI(rm.getValue())
+      }
+    })
+    .build(appLoader)
+
+  private val loaderServlet = new HttpServlet {
+    protected override def doGet(req: HttpServletRequest, res: HttpServletResponse): Unit = {
+      // Parse the URI created by getAttemptURI(). It contains an app ID and an optional
+      // attempt ID (separated by a slash).
+      val parts = Option(req.getPathInfo()).getOrElse("").split("/")
+      if (parts.length < 2) {
+        res.sendError(HttpServletResponse.SC_BAD_REQUEST,
+          s"Unexpected path info in request (URI = ${req.getRequestURI()}")
+        return
+      }
+
+      val appId = parts(1)
+      val attemptId = if (parts.length >= 3) Some(parts(2)) else None
+
+      // Since we may have applications with multiple attempts mixed with applications with a
+      // single attempt, we need to try both. Try the single-attempt route first, and if an
+      // error is raised, then try the multiple attempt route.
+      if (!loadAppUi(appId, None) && (!attemptId.isDefined || !loadAppUi(appId, attemptId))) {
+        val msg = <div class="row-fluid">Application {appId} not found.</div>
+        res.setStatus(HttpServletResponse.SC_NOT_FOUND)
+        UIUtils.basicSparkPage(msg, "Not Found").foreach { n =>
+          res.getWriter().write(n.toString)
+        }
+        return
+      }
+
+      // Note we don't use the UI retrieved from the cache; the cache loader above will register
+      // the app's UI, and all we need to do is redirect the user to the same URI that was
+      // requested, and the proper data should be served at that point.
+      res.sendRedirect(res.encodeRedirectURL(req.getRequestURI()))
+    }
+
+    // SPARK-5983 ensure TRACE is not supported
+    protected override def doTrace(req: HttpServletRequest, res: HttpServletResponse): Unit = {
+      res.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED)
+    }
+  }
+
+  def getSparkUI(appKey: String): Option[SparkUI] = {
+    Option(appCache.get(appKey))
+  }
 
   initialize()
 
@@ -98,108 +125,26 @@ class HistoryServer(
    */
   def initialize() {
     attachPage(new HistoryPage(this))
-    attachHandler(createStaticHandler(STATIC_RESOURCE_DIR, "/static"))
+
+    attachHandler(ApiRootResource.getServletHandler(this))
+
+    attachHandler(createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"))
+
+    val contextHandler = new ServletContextHandler
+    contextHandler.setContextPath(HistoryServer.UI_PATH_PREFIX)
+    contextHandler.addServlet(new ServletHolder(loaderServlet), "/*")
+    attachHandler(contextHandler)
   }
 
   /** Bind to the HTTP server behind this web interface. */
   override def bind() {
     super.bind()
-    logCheckingThread.start()
-  }
-
-  /**
-   * Check for any updates to event logs in the base directory. This is only effective once
-   * the server has been bound.
-   *
-   * If a new completed application is found, the server renders the associated SparkUI
-   * from the application's event logs, attaches this UI to itself, and stores metadata
-   * information for this application.
-   *
-   * If the logs for an existing completed application are no longer found, the server
-   * removes all associated information and detaches the SparkUI.
-   */
-  def checkForLogs() = synchronized {
-    if (serverInfo.isDefined) {
-      lastLogCheckTime = System.currentTimeMillis
-      logDebug("Checking for logs. Time is now %d.".format(lastLogCheckTime))
-      try {
-        val logStatus = fileSystem.listStatus(new Path(baseLogDir))
-        val logDirs = if (logStatus != null) logStatus.filter(_.isDir).toSeq else Seq[FileStatus]()
-        val logInfos = logDirs
-          .sortBy { dir => getModificationTime(dir) }
-          .map { dir => (dir, EventLoggingListener.parseLoggingInfo(dir.getPath, fileSystem)) }
-          .filter { case (dir, info) => info.applicationComplete }
-
-        // Logging information for applications that should be retained
-        val retainedLogInfos = logInfos.takeRight(RETAINED_APPLICATIONS)
-        val retainedAppIds = retainedLogInfos.map { case (dir, _) => dir.getPath.getName }
-
-        // Remove any applications that should no longer be retained
-        appIdToInfo.foreach { case (appId, info) =>
-          if (!retainedAppIds.contains(appId)) {
-            detachSparkUI(info.ui)
-            appIdToInfo.remove(appId)
-          }
-        }
-
-        // Render the application's UI if it is not already there
-        retainedLogInfos.foreach { case (dir, info) =>
-          val appId = dir.getPath.getName
-          if (!appIdToInfo.contains(appId)) {
-            renderSparkUI(dir, info)
-          }
-        }
-
-        // Track the total number of completed applications observed this round
-        numCompletedApplications = logInfos.size
-
-      } catch {
-        case e: Exception => logError("Exception in checking for event log updates", e)
-      }
-    } else {
-      logWarning("Attempted to check for event log updates before binding the server.")
-    }
-  }
-
-  /**
-   * Render a new SparkUI from the event logs if the associated application is completed.
-   *
-   * HistoryServer looks for a special file that indicates application completion in the given
-   * directory. If this file exists, the associated application is regarded to be completed, in
-   * which case the server proceeds to render the SparkUI. Otherwise, the server does nothing.
-   */
-  private def renderSparkUI(logDir: FileStatus, elogInfo: EventLoggingInfo) {
-    val path = logDir.getPath
-    val appId = path.getName
-    val replayBus = new ReplayListenerBus(elogInfo.logPaths, fileSystem, elogInfo.compressionCodec)
-    val appListener = new ApplicationEventListener
-    replayBus.addListener(appListener)
-    val appConf = conf.clone()
-    val appSecManager = new SecurityManager(appConf)
-    val ui = new SparkUI(conf, appSecManager, replayBus, appId, "/history/" + appId)
-
-    // Do not call ui.bind() to avoid creating a new server for each application
-    replayBus.replay()
-    if (appListener.applicationStarted) {
-      appSecManager.setUIAcls(HISTORY_UI_ACLS_ENABLED)
-      appSecManager.setViewAcls(appListener.sparkUser, appListener.viewAcls)
-      attachSparkUI(ui)
-      val appName = appListener.appName
-      val sparkUser = appListener.sparkUser
-      val startTime = appListener.startTime
-      val endTime = appListener.endTime
-      val lastUpdated = getModificationTime(logDir)
-      ui.setAppName(appName + " (completed)")
-      appIdToInfo(appId) = ApplicationHistoryInfo(appId, appName, startTime, endTime,
-        lastUpdated, sparkUser, path, ui)
-    }
   }
 
   /** Stop the server and close the file system. */
   override def stop() {
     super.stop()
-    stopped = true
-    fileSystem.close()
+    provider.stop()
   }
 
   /** Attach a reconstructed UI to this server. Only valid after bind(). */
@@ -215,66 +160,80 @@ class HistoryServer(
     ui.getHandlers.foreach(detachHandler)
   }
 
-  /** Return the address of this server. */
-  def getAddress: String = "http://" + publicHost + ":" + boundPort
+  /**
+   * Returns a list of available applications, in descending order according to their end time.
+   *
+   * @return List of all known applications.
+   */
+  def getApplicationList(): Iterable[ApplicationHistoryInfo] = {
+    provider.getListing()
+  }
 
-  /** Return the number of completed applications found, whether or not the UI is rendered. */
-  def getNumApplications: Int = numCompletedApplications
+  def getApplicationInfoList: Iterator[ApplicationInfo] = {
+    getApplicationList().iterator.map(ApplicationsListResource.appHistoryInfoToPublicAppInfo)
+  }
 
-  /** Return when this directory was last modified. */
-  private def getModificationTime(dir: FileStatus): Long = {
+  /**
+   * Returns the provider configuration to show in the listing page.
+   *
+   * @return A map with the provider's configuration.
+   */
+  def getProviderConfig(): Map[String, String] = provider.getConfig()
+
+  private def loadAppUi(appId: String, attemptId: Option[String]): Boolean = {
     try {
-      val logFiles = fileSystem.listStatus(dir.getPath)
-      if (logFiles != null && !logFiles.isEmpty) {
-        logFiles.map(_.getModificationTime).max
-      } else {
-        dir.getModificationTime
-      }
+      appCache.get(appId + attemptId.map { id => s"/$id" }.getOrElse(""))
+      true
     } catch {
-      case e: Exception =>
-        logError("Exception in accessing modification time of %s".format(dir.getPath), e)
-        -1L
+      case e: Exception => e.getCause() match {
+        case nsee: NoSuchElementException =>
+          false
+
+        case cause: Exception => throw cause
+      }
     }
   }
+
 }
 
 /**
  * The recommended way of starting and stopping a HistoryServer is through the scripts
- * start-history-server.sh and stop-history-server.sh. The path to a base log directory
- * is must be specified, while the requested UI port is optional. For example:
+ * start-history-server.sh and stop-history-server.sh. The path to a base log directory,
+ * as well as any other relevant history server configuration, should be specified via
+ * the $SPARK_HISTORY_OPTS environment variable. For example:
  *
- *   ./sbin/spark-history-server.sh /tmp/spark-events
- *   ./sbin/spark-history-server.sh hdfs://1.2.3.4:9000/spark-events
+ *   export SPARK_HISTORY_OPTS="-Dspark.history.fs.logDirectory=/tmp/spark-events"
+ *   ./sbin/start-history-server.sh
  *
  * This launches the HistoryServer as a Spark daemon.
  */
-object HistoryServer {
+object HistoryServer extends Logging {
   private val conf = new SparkConf
 
-  // Interval between each check for event log updates
-  val UPDATE_INTERVAL_MS = conf.getInt("spark.history.updateInterval", 10) * 1000
-
-  // How many applications to retain
-  val RETAINED_APPLICATIONS = conf.getInt("spark.history.retainedApplications", 250)
-
-  // The port to which the web UI is bound
-  val WEB_UI_PORT = conf.getInt("spark.history.ui.port", 18080)
-
-  // set whether to enable or disable view acls for all applications
-  val HISTORY_UI_ACLS_ENABLED = conf.getBoolean("spark.history.ui.acls.enable", false)
-
-  val STATIC_RESOURCE_DIR = SparkUI.STATIC_RESOURCE_DIR
+  val UI_PATH_PREFIX = "/history"
 
   def main(argStrings: Array[String]) {
+    SignalLogger.register(log)
+    new HistoryServerArguments(conf, argStrings)
     initSecurity()
-    val args = new HistoryServerArguments(argStrings)
     val securityManager = new SecurityManager(conf)
-    val server = new HistoryServer(args.logDir, securityManager, conf)
+
+    val providerName = conf.getOption("spark.history.provider")
+      .getOrElse(classOf[FsHistoryProvider].getName())
+    val provider = Class.forName(providerName)
+      .getConstructor(classOf[SparkConf])
+      .newInstance(conf)
+      .asInstanceOf[ApplicationHistoryProvider]
+
+    val port = conf.getInt("spark.history.ui.port", 18080)
+
+    val server = new HistoryServer(conf, provider, securityManager, port)
     server.bind()
+
+    Utils.addShutdownHook { () => server.stop() }
 
     // Wait until the end of the world... or if the HistoryServer process is manually stopped
     while(true) { Thread.sleep(Int.MaxValue) }
-    server.stop()
   }
 
   def initSecurity() {
@@ -290,18 +249,9 @@ object HistoryServer {
     }
   }
 
-}
+  private[history] def getAttemptURI(appId: String, attemptId: Option[String]): String = {
+    val attemptSuffix = attemptId.map { id => s"/$id" }.getOrElse("")
+    s"${HistoryServer.UI_PATH_PREFIX}/${appId}${attemptSuffix}"
+  }
 
-
-private[spark] case class ApplicationHistoryInfo(
-    id: String,
-    name: String,
-    startTime: Long,
-    endTime: Long,
-    lastUpdated: Long,
-    sparkUser: String,
-    logDirPath: Path,
-    ui: SparkUI) {
-  def started = startTime != -1
-  def completed = endTime != -1
 }

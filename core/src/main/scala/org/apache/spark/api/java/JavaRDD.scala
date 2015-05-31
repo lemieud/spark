@@ -17,17 +17,20 @@
 
 package org.apache.spark.api.java
 
+import java.util.Comparator
+
 import scala.language.implicitConversions
 import scala.reflect.ClassTag
 
 import org.apache.spark._
+import org.apache.spark.api.java.JavaSparkContext.fakeClassTag
 import org.apache.spark.api.java.function.{Function => JFunction}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.Utils
 
 class JavaRDD[T](val rdd: RDD[T])(implicit val classTag: ClassTag[T])
-  extends JavaRDDLike[T, JavaRDD[T]] {
+  extends AbstractJavaRDDLike[T, JavaRDD[T]] {
 
   override def wrapRDD(rdd: RDD[T]): JavaRDD[T] = JavaRDD.fromRDD(rdd)
 
@@ -98,15 +101,48 @@ class JavaRDD[T](val rdd: RDD[T])(implicit val classTag: ClassTag[T])
 
   /**
    * Return a sampled subset of this RDD.
+   *
+   * @param withReplacement can elements be sampled multiple times (replaced when sampled out)
+   * @param fraction expected size of the sample as a fraction of this RDD's size
+   *  without replacement: probability that each element is chosen; fraction must be [0, 1]
+   *  with replacement: expected number of times each element is chosen; fraction must be >= 0
    */
   def sample(withReplacement: Boolean, fraction: Double): JavaRDD[T] =
     sample(withReplacement, fraction, Utils.random.nextLong)
-    
+
   /**
    * Return a sampled subset of this RDD.
+   *
+   * @param withReplacement can elements be sampled multiple times (replaced when sampled out)
+   * @param fraction expected size of the sample as a fraction of this RDD's size
+   *  without replacement: probability that each element is chosen; fraction must be [0, 1]
+   *  with replacement: expected number of times each element is chosen; fraction must be >= 0
+   * @param seed seed for the random number generator
    */
   def sample(withReplacement: Boolean, fraction: Double, seed: Long): JavaRDD[T] =
     wrapRDD(rdd.sample(withReplacement, fraction, seed))
+
+
+  /**
+   * Randomly splits this RDD with the provided weights.
+   *
+   * @param weights weights for splits, will be normalized if they don't sum to 1
+   *
+   * @return split RDDs in an array
+   */
+  def randomSplit(weights: Array[Double]): Array[JavaRDD[T]] =
+    randomSplit(weights, Utils.random.nextLong)
+
+  /**
+   * Randomly splits this RDD with the provided weights.
+   *
+   * @param weights weights for splits, will be normalized if they don't sum to 1
+   * @param seed random seed
+   *
+   * @return split RDDs in an array
+   */
+  def randomSplit(weights: Array[Double], seed: Long): Array[JavaRDD[T]] =
+    rdd.randomSplit(weights, seed).map(wrapRDD)
 
   /**
    * Return the union of this RDD and another one. Any identical elements will appear multiple
@@ -143,13 +179,26 @@ class JavaRDD[T](val rdd: RDD[T])(implicit val classTag: ClassTag[T])
   def subtract(other: JavaRDD[T], p: Partitioner): JavaRDD[T] =
     wrapRDD(rdd.subtract(other, p))
 
-  override def toString = rdd.toString
+  override def toString: String = rdd.toString
 
   /** Assign a name to this RDD */
   def setName(name: String): JavaRDD[T] = {
     rdd.setName(name)
     this
   }
+
+  /**
+   * Return this RDD sorted by the given key function.
+   */
+  def sortBy[S](f: JFunction[T, S], ascending: Boolean, numPartitions: Int): JavaRDD[T] = {
+    import scala.collection.JavaConverters._
+    def fn: (T) => S = (x: T) => f.call(x)
+    import com.google.common.collect.Ordering  // shadows scala.math.Ordering
+    implicit val ordering = Ordering.natural().asInstanceOf[Ordering[S]]
+    implicit val ctag: ClassTag[S] = fakeClassTag
+    wrapRDD(rdd.sortBy(fn, ascending, numPartitions))
+  }
+
 }
 
 object JavaRDD {
